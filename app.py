@@ -47,6 +47,26 @@ def remove_live_name_from_filename(filename: str) -> str:
     return filename
 
 
+def calculate_api_cost(prompt_tokens: int, completion_tokens: int) -> float:
+    """
+    API使用料金を計算（GPT-4o-mini）
+    
+    Args:
+        prompt_tokens: 入力トークン数
+        completion_tokens: 出力トークン数
+        
+    Returns:
+        推定費用（ドル）
+    """
+    INPUT_COST_PER_MILLION = 0.15  # $0.15 per 1M tokens
+    OUTPUT_COST_PER_MILLION = 0.60  # $0.60 per 1M tokens
+    
+    input_cost = (prompt_tokens / 1_000_000) * INPUT_COST_PER_MILLION
+    output_cost = (completion_tokens / 1_000_000) * OUTPUT_COST_PER_MILLION
+    
+    return input_cost + output_cost
+
+
 def create_download_link(data: bytes, filename: str, mime_type: str) -> str:
     """
     Base64エンコードしたダウンロードリンクを作成
@@ -240,6 +260,13 @@ def show_comment_analysis_page():
         st.session_state.question_df_data = None
     if "uploaded_csv_filename" not in st.session_state:
         st.session_state.uploaded_csv_filename = ""
+    if "api_usage" not in st.session_state:
+        st.session_state.api_usage = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "estimated_cost_usd": 0.0
+        }
     
     # サイドバー
     with st.sidebar:
@@ -251,6 +278,17 @@ def show_comment_analysis_page():
             st.success("✓ OpenAI APIキーが設定されています")
         else:
             st.error("✗ OpenAI APIキーが設定されていません")
+        
+        # API使用状況（分析完了時のみ表示）
+        if st.session_state.get("analysis_complete") and st.session_state.get("api_usage") and st.session_state.api_usage["total_tokens"] > 0:
+            st.divider()
+            st.subheader("API使用状況")
+            usage = st.session_state.api_usage
+            st.metric("使用トークン数", f"{usage['total_tokens']:,}")
+            st.write(f"入力: {usage['prompt_tokens']:,} トークン")
+            st.write(f"出力: {usage['completion_tokens']:,} トークン")
+            st.metric("推定費用", f"${usage['estimated_cost_usd']:.4f}")
+            st.caption("モデル: GPT-4o-mini")
     
     # CSVファイルアップロード
     st.header("1. CSVファイルのアップロード")
@@ -370,6 +408,14 @@ def show_comment_analysis_page():
         if start_analysis or st.session_state.get("analysis_resume", False):
             # 中断フラグをリセット
             st.session_state.analysis_cancelled = False
+            # トークン使用量をリセット（新しい分析開始時のみ）
+            if start_analysis:
+                st.session_state.api_usage = {
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                    "estimated_cost_usd": 0.0
+                }
             # 一時ファイルのパスを設定（PCスリープ対策）
             if not st.session_state.analysis_save_path:
                 save_dir = tempfile.gettempdir()
@@ -452,13 +498,36 @@ def show_comment_analysis_page():
             try:
                 # AI分析実行（統合プロンプト使用：50%高速化）
                 with st.spinner("AI分析を実行中です。しばらくお待ちください..."):
-                    analyzed_df = analyze_all_comments(df, update_progress, save_intermediate_results, check_cancel)
+                    analysis_result = analyze_all_comments(df, update_progress, save_intermediate_results, check_cancel)
+                
+                # 分析結果からDataFrameとトークン使用量情報を取得
+                if isinstance(analysis_result, dict):
+                    analyzed_df = analysis_result["df"]
+                    api_usage_info = analysis_result.get("api_usage", {})
+                else:
+                    # 後方互換性のため、DataFrameが直接返された場合
+                    analyzed_df = analysis_result
+                    api_usage_info = {}
                 
                 st.session_state.processed_data = analyzed_df
                 st.session_state.analysis_complete = True
                 st.session_state.analysis_resume = False
                 st.session_state.analysis_original_df = None
                 st.session_state.analysis_cancelled = False  # 完了時に中断フラグをクリア
+                
+                # トークン使用量情報をセッションステートに保存
+                if api_usage_info:
+                    prompt_tokens = api_usage_info.get("prompt_tokens", 0)
+                    completion_tokens = api_usage_info.get("completion_tokens", 0)
+                    total_tokens = api_usage_info.get("total_tokens", 0)
+                    estimated_cost = calculate_api_cost(prompt_tokens, completion_tokens)
+                    
+                    st.session_state.api_usage = {
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": completion_tokens,
+                        "total_tokens": total_tokens,
+                        "estimated_cost_usd": estimated_cost
+                    }
                 
                 # CSVファイルを自動生成（分析完了時に自動実行）
                 try:

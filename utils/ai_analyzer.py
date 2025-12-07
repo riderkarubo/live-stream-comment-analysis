@@ -476,7 +476,8 @@ def analyze_comment_combined(comment_text: str, username: str, guest_id=None, us
         user_id: ユーザーID（オプション、値が存在する場合に公式コメント判定）
         
     Returns:
-        (attribute, sentiment) のタプル
+        (attribute, sentiment, tokens_info) のタプル
+        tokens_infoは {"prompt_tokens": int, "completion_tokens": int, "total_tokens": int} の辞書
     """
     import pandas as pd
     
@@ -493,9 +494,9 @@ def analyze_comment_combined(comment_text: str, username: str, guest_id=None, us
             if pd.notna(user_id):
                 user_id_str = str(user_id).strip()
                 if user_id_str:  # 空文字列でない
-                    # 感情だけ分析
+                    # 感情だけ分析（トークン使用量は0として返す）
                     sentiment = analyze_comment_sentiment(comment_text)
-                    return ("公式コメント", sentiment)
+                    return ("公式コメント", sentiment, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})
         except (ValueError, AttributeError, TypeError):
             pass  # user_idが不正な場合は通常の処理に進む
     
@@ -504,17 +505,17 @@ def analyze_comment_combined(comment_text: str, username: str, guest_id=None, us
         if guest_id:
             guest_id_str = str(guest_id).strip()
             if guest_id_str == OFFICIAL_GUEST_ID:
-                # 感情だけ分析
+                # 感情だけ分析（トークン使用量は0として返す）
                 sentiment = analyze_comment_sentiment(comment_text)
-                return ("公式コメント", sentiment)
+                return ("公式コメント", sentiment, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})
     except (ValueError, AttributeError):
         pass  # guest_idが不正な場合は通常の処理に進む
     
     # usernameが"マツキヨココカラSTAFF"の場合は公式コメントとして判定
     if username and str(username).strip() == "マツキヨココカラSTAFF":
-        # 感情だけ分析
+        # 感情だけ分析（トークン使用量は0として返す）
         sentiment = analyze_comment_sentiment(comment_text)
-        return ("公式コメント", sentiment)
+        return ("公式コメント", sentiment, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})
     
     prompt = get_combined_analysis_prompt(comment_text, username)
     
@@ -577,6 +578,16 @@ def analyze_comment_combined(comment_text: str, username: str, guest_id=None, us
         
         if api_response is None:
             raise Exception("API呼び出しに失敗しました。")
+        
+        # トークン使用量を取得
+        tokens_info = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        if hasattr(api_response, 'usage') and api_response.usage:
+            usage = api_response.usage
+            tokens_info = {
+                "prompt_tokens": usage.prompt_tokens,
+                "completion_tokens": usage.completion_tokens,
+                "total_tokens": usage.total_tokens
+            }
         
         raw_response = api_response.choices[0].message.content
         
@@ -808,7 +819,18 @@ def analyze_comment_combined(comment_text: str, username: str, guest_id=None, us
         if analyze_comment_combined._debug_count <= 10:
             print(f"DEBUG [統合分析] 最終結果 - 属性: {attribute}, 感情: {sentiment}", file=sys.stderr)
         
-        return (attribute, sentiment)
+        # トークン使用量を取得
+        if api_response and hasattr(api_response, 'usage') and api_response.usage:
+            usage = api_response.usage
+            tokens_info = {
+                "prompt_tokens": usage.prompt_tokens,
+                "completion_tokens": usage.completion_tokens,
+                "total_tokens": usage.total_tokens
+            }
+        else:
+            tokens_info = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        
+        return (attribute, sentiment, tokens_info)
         
     except Exception as e:
         import sys
@@ -832,7 +854,8 @@ def analyze_comment_combined(comment_text: str, username: str, guest_id=None, us
                 attribute = analyze_comment_attribute(comment_text, username, guest_id, None, None)
                 sentiment = analyze_comment_sentiment(comment_text)
                 print(f"DEBUG [統合分析] フォールバック成功 - 属性: {attribute}, 感情: {sentiment}", file=sys.stderr)
-                return (attribute, sentiment)
+                tokens_info = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+                return (attribute, sentiment, tokens_info)
             except Exception as fallback_error:
                 # フォールバックも失敗した場合
                 error_str_fallback = str(fallback_error)
@@ -870,12 +893,13 @@ def _analyze_single_comment(idx, row, rate_limit_monitor):
     
     try:
         # 統合分析（1回のAPI呼び出しで属性と感情の両方を取得：50%高速化）
-        attribute, sentiment = analyze_comment_combined(comment_text, username, guest_id, user_type, user_id)
+        attribute, sentiment, tokens_info = analyze_comment_combined(comment_text, username, guest_id, user_type, user_id)
         
         # 結果を保存
         result_row = row.to_dict()
         result_row["チャットの属性"] = attribute
         result_row["チャット感情"] = sentiment
+        result_row["_tokens_info"] = tokens_info  # トークン情報を一時的に保存
         
         return (idx, result_row)
     except Exception as e:
@@ -940,6 +964,11 @@ def analyze_all_comments(df, progress_callback=None, save_callback=None, check_c
     # レート制限エラーの監視用カウンター（テスト用）
     rate_limit_error_count = 0
     
+    # トークン使用量の累積
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
+    total_tokens = 0
+    
     # バッチ処理で並列実行
     completed_count = start_idx
     idx = start_idx
@@ -989,6 +1018,13 @@ def analyze_all_comments(df, progress_callback=None, save_callback=None, check_c
                 try:
                     _, result_row = future.result()
                     with results_lock:
+                        # トークン使用量を累積
+                        if "_tokens_info" in result_row:
+                            tokens_info = result_row.pop("_tokens_info")  # トークン情報を取得して削除
+                            total_prompt_tokens += tokens_info.get("prompt_tokens", 0)
+                            total_completion_tokens += tokens_info.get("completion_tokens", 0)
+                            total_tokens += tokens_info.get("total_tokens", 0)
+                        
                         results_dict[batch_idx] = result_row
                         completed_count += 1
                         
@@ -1049,5 +1085,14 @@ def analyze_all_comments(df, progress_callback=None, save_callback=None, check_c
         print("\n✓ レート制限エラーは発生しませんでした（8並列処理で正常に動作しました）。", file=sys.stderr)
     
     result_df = pd.DataFrame(results)
-    return result_df
+    
+    # トークン使用量情報を返り値に含める
+    return {
+        "df": result_df,
+        "api_usage": {
+            "prompt_tokens": total_prompt_tokens,
+            "completion_tokens": total_completion_tokens,
+            "total_tokens": total_tokens
+        }
+    }
 
