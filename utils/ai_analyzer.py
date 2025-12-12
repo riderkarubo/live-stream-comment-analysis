@@ -7,17 +7,35 @@ import re
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
-from config import OPENAI_API_KEY, CHAT_ATTRIBUTES, CHAT_SENTIMENTS, COMPANY_NAME, OFFICIAL_GUEST_ID
+from config import (
+    OPENAI_API_KEY,
+    CHAT_ATTRIBUTES,
+    CHAT_SENTIMENTS,
+    COMPANY_NAME,
+    OFFICIAL_GUEST_ID,
+    get_openai_api_key,
+    get_current_company_config,
+)
 from prompts.analysis_prompts import (
     get_attribute_analysis_prompt,
     get_sentiment_analysis_prompt,
     get_combined_analysis_prompt
 )
 
-# OpenAIクライアントの初期化
-client = None
-if OPENAI_API_KEY:
-    client = openai.OpenAI(api_key=OPENAI_API_KEY)
+
+def get_openai_client():
+    """
+    OpenAIクライアントを動的に取得
+
+    ユーザー入力のAPIキーを優先して使用します。
+
+    Returns:
+        OpenAIクライアント、APIキーがなければNone
+    """
+    api_key = get_openai_api_key()
+    if not api_key:
+        raise ValueError("OpenAI APIキーが設定されていません。サイドバーからAPIキーを設定してください。")
+    return openai.OpenAI(api_key=api_key)
 
 
 class RateLimitMonitor:
@@ -61,6 +79,28 @@ class RateLimitMonitor:
 
 # グローバルなレート制限監視インスタンス
 _rate_limit_monitor = RateLimitMonitor(max_requests_per_minute=480)
+
+
+def _get_official_usernames():
+    """
+    現在の企業設定から公式ユーザー名のリストを取得
+    """
+    try:
+        company_config = get_current_company_config()
+        official = company_config.get("official_username") or []
+        if isinstance(official, str):
+            official = [official]
+        return [str(name).strip() for name in official if name]
+    except Exception:
+        return []
+
+
+def _is_official_username(username: Optional[str]) -> bool:
+    """usernameが公式リストに含まれているかを判定"""
+    if not username:
+        return False
+    official_names = _get_official_usernames()
+    return str(username).strip() in official_names
 
 
 def parse_json_response(response_text: str) -> Optional[Dict]:
@@ -170,15 +210,16 @@ def analyze_comment_attribute(comment_text: str, username: str, guest_id=None, u
     except (ValueError, AttributeError):
         pass  # guest_idが不正な場合は通常の処理に進む
     
-    # usernameが"マツキヨココカラSTAFF"の場合は公式コメントとして判定
-    if username and str(username).strip() == "マツキヨココカラSTAFF":
+    # 企業設定で定義された公式ユーザー名の場合は公式コメントとして判定
+    if _is_official_username(username):
         return "公式コメント"
-    
+
     prompt = get_attribute_analysis_prompt(comment_text, username)
-    
+
+    client = get_openai_client()
     if not client:
-        raise ValueError("OPENAI_API_KEYが設定されていません。")
-    
+        raise ValueError("OpenAI APIキーが設定されていません。サイドバーからAPIキーを設定してください。")
+
     try:
         response = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -241,36 +282,12 @@ def analyze_comment_attribute(comment_text: str, username: str, guest_id=None, u
         
         # 取得した属性がリストに含まれているか確認（完全一致）
         if attribute_cleaned in CHAT_ATTRIBUTES:
-            # 「公式コメント」が返された場合、usernameをチェック
-            if attribute_cleaned == "公式コメント":
-                # usernameがStarbucks Coffee Japanの場合のみ「公式コメント」を返す
-                if username == COMPANY_NAME:
-                    if analyze_comment_attribute._debug_count <= 10:
-                        print(f"DEBUG [属性分析] 「公式コメント」が返され、usernameが{COMPANY_NAME}のため「公式コメント」にマッピング", file=sys.stderr)
-                    return "公式コメント"
-                else:
-                    # usernameがStarbucks Coffee Japanでない場合は「絵文字のみ」にマッピング
-                    if analyze_comment_attribute._debug_count <= 10:
-                        print(f"DEBUG [属性分析] 「公式コメント」が返されたが、usernameが{COMPANY_NAME}ではないため「絵文字のみ」にマッピング", file=sys.stderr)
-                    return "絵文字のみ"
             if analyze_comment_attribute._debug_count <= 10:
                 print(f"DEBUG [属性分析] 完全一致でマッチ: {attribute_cleaned}", file=sys.stderr)
             return attribute_cleaned
         
         # 元のattributeでも確認
         if attribute in CHAT_ATTRIBUTES:
-            # 「公式コメント」が返された場合、usernameをチェック
-            if attribute == "公式コメント":
-                # usernameがStarbucks Coffee Japanの場合のみ「公式コメント」を返す
-                if username == COMPANY_NAME:
-                    if analyze_comment_attribute._debug_count <= 10:
-                        print(f"DEBUG [属性分析] 「公式コメント」が返され、usernameが{COMPANY_NAME}のため「公式コメント」にマッピング", file=sys.stderr)
-                    return "公式コメント"
-                else:
-                    # usernameがStarbucks Coffee Japanでない場合は「絵文字のみ」にマッピング
-                    if analyze_comment_attribute._debug_count <= 10:
-                        print(f"DEBUG [属性分析] 「公式コメント」が返されたが、usernameが{COMPANY_NAME}ではないため「絵文字のみ」にマッピング", file=sys.stderr)
-                    return "絵文字のみ"
             if analyze_comment_attribute._debug_count <= 10:
                 print(f"DEBUG [属性分析] 完全一致でマッチ（元の値）: {attribute}", file=sys.stderr)
             return attribute
@@ -295,18 +312,6 @@ def analyze_comment_attribute(comment_text: str, username: str, guest_id=None, u
         
         # マッチした属性がある場合
         if matched_attribute:
-            # 「公式コメント」が返された場合、usernameをチェック
-            if matched_attribute == "公式コメント":
-                # usernameがStarbucks Coffee Japanの場合のみ「公式コメント」を返す
-                if username == COMPANY_NAME:
-                    if analyze_comment_attribute._debug_count <= 10:
-                        print(f"DEBUG [属性分析] 「公式コメント」が返され、usernameが{COMPANY_NAME}のため「公式コメント」にマッピング", file=sys.stderr)
-                    return "公式コメント"
-                else:
-                    # usernameがStarbucks Coffee Japanでない場合は「絵文字のみ」にマッピング
-                    if analyze_comment_attribute._debug_count <= 10:
-                        print(f"DEBUG [属性分析] 「公式コメント」が返されたが、usernameが{COMPANY_NAME}ではないため「絵文字のみ」にマッピング", file=sys.stderr)
-                    return "絵文字のみ"
             if analyze_comment_attribute._debug_count <= 10:
                 print(f"DEBUG [属性分析] マッチした属性: {matched_attribute}", file=sys.stderr)
             return matched_attribute
@@ -337,18 +342,19 @@ def analyze_comment_attribute(comment_text: str, username: str, guest_id=None, u
 def analyze_comment_sentiment(comment_text: str) -> str:
     """
     コメントの感情を分析
-    
+
     Args:
         comment_text: コメント本文
-        
+
     Returns:
         チャット感情
     """
     prompt = get_sentiment_analysis_prompt(comment_text)
-    
+
+    client = get_openai_client()
     if not client:
-        raise ValueError("OPENAI_API_KEYが設定されていません。")
-    
+        raise ValueError("OpenAI APIキーが設定されていません。サイドバーからAPIキーを設定してください。")
+
     try:
         response = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -511,22 +517,23 @@ def analyze_comment_combined(comment_text: str, username: str, guest_id=None, us
     except (ValueError, AttributeError):
         pass  # guest_idが不正な場合は通常の処理に進む
     
-    # usernameが"マツキヨココカラSTAFF"の場合は公式コメントとして判定
-    if username and str(username).strip() == "マツキヨココカラSTAFF":
+    # 企業設定で定義された公式ユーザー名の場合は公式コメントとして判定
+    if _is_official_username(username):
         # 感情だけ分析（トークン使用量は0として返す）
         sentiment = analyze_comment_sentiment(comment_text)
         return ("公式コメント", sentiment, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})
     
     prompt = get_combined_analysis_prompt(comment_text, username)
-    
+
+    client = get_openai_client()
     if not client:
-        raise ValueError("OPENAI_API_KEYが設定されていません。")
-    
+        raise ValueError("OpenAI APIキーが設定されていません。サイドバーからAPIキーを設定してください。")
+
     try:
         # レート制限エラー対応：最大3回リトライ
         max_retries = 3
         retry_delay = 60  # 60秒待機
-        
+
         api_response = None
         for attempt in range(max_retries):
             try:
@@ -734,19 +741,6 @@ def analyze_comment_combined(comment_text: str, username: str, guest_id=None, us
             # 従来の方法で感情を取得
             sentiment = analyze_comment_sentiment(comment_text)
         
-        # 最終的なattributeが「公式コメント」の場合、usernameをチェック
-        if attribute == "公式コメント":
-            # usernameがStarbucks Coffee Japanの場合のみ「公式コメント」を返す
-            if username == COMPANY_NAME:
-                if analyze_comment_combined._debug_count <= 10:
-                    print(f"DEBUG [統合分析] 最終チェック: 「公式コメント」が返され、usernameが{COMPANY_NAME}のため「公式コメント」にマッピング", file=sys.stderr)
-                attribute = "公式コメント"
-            else:
-                # usernameがStarbucks Coffee Japanでない場合は「絵文字のみ」にマッピング
-                if analyze_comment_combined._debug_count <= 10:
-                    print(f"DEBUG [統合分析] 最終チェック: 「公式コメント」が返されたが、usernameが{COMPANY_NAME}ではないため「絵文字のみ」にマッピング", file=sys.stderr)
-                attribute = "絵文字のみ"
-        
         # 最終的な検証：属性と感情が有効なカテゴリに含まれているか確認
         if attribute not in CHAT_ATTRIBUTES:
             import sys
@@ -867,7 +861,8 @@ def analyze_comment_combined(comment_text: str, username: str, guest_id=None, us
                     raise Exception(f"レート制限エラーが発生しました。処理を中断して、続きから再開してください。エラー詳細: {error_str_fallback}")
                 # その他のエラーはデフォルト値を返す
                 print("DEBUG [統合分析] デフォルト値を返す", file=sys.stderr)
-                return ("絵文字のみ", "どちらでもない")
+                tokens_info = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+                return ("絵文字のみ", "どちらでもない", tokens_info)
 
 
 def _analyze_single_comment(idx, row, rate_limit_monitor):
@@ -891,27 +886,16 @@ def _analyze_single_comment(idx, row, rate_limit_monitor):
     # レート制限をチェックしてから処理
     rate_limit_monitor.wait_if_needed()
     
-    try:
-        # 統合分析（1回のAPI呼び出しで属性と感情の両方を取得：50%高速化）
-        attribute, sentiment, tokens_info = analyze_comment_combined(comment_text, username, guest_id, user_type, user_id)
-        
-        # 結果を保存
-        result_row = row.to_dict()
-        result_row["チャットの属性"] = attribute
-        result_row["チャット感情"] = sentiment
-        result_row["_tokens_info"] = tokens_info  # トークン情報を一時的に保存
-        
-        return (idx, result_row)
-    except Exception as e:
-        error_str = str(e)
-        # レート制限エラーは再発生させる
-        if "レート制限" in error_str or "rate_limit" in error_str.lower() or "429" in error_str:
-            raise  # 上位で処理
-        # その他のエラーはデフォルト値を返す
-        result_row = row.to_dict()
-        result_row["チャットの属性"] = "絵文字のみ"
-        result_row["チャット感情"] = "どちらでもない"
-        return (idx, result_row)
+    # 統合分析（1回のAPI呼び出しで属性と感情の両方を取得：50%高速化）
+    attribute, sentiment, tokens_info = analyze_comment_combined(comment_text, username, guest_id, user_type, user_id)
+    
+    # 結果を保存
+    result_row = row.to_dict()
+    result_row["チャットの属性"] = attribute
+    result_row["チャット感情"] = sentiment
+    result_row["_tokens_info"] = tokens_info  # トークン情報を一時的に保存
+    
+    return (idx, result_row)
 
 
 def analyze_all_comments(df, progress_callback=None, save_callback=None, check_cancel_callback=None) -> Dict:
@@ -1052,17 +1036,11 @@ def analyze_all_comments(df, progress_callback=None, save_callback=None, check_c
                         # エラーを再発生（上位で処理）
                         raise Exception(f"レート制限エラーが発生しました。処理を中断して、続きから再開してください。エラー詳細: {error_str}")
                     else:
-                        print(f"分析エラー (インデックス {batch_idx}): {e}")
-                        # エラーが発生したコメントはデフォルト値で処理
-                        row = df.iloc[batch_idx]
-                        result_row = row.to_dict()
-                        result_row["チャットの属性"] = "絵文字のみ"
-                        result_row["チャット感情"] = "どちらでもない"
-                        with results_lock:
-                            results_dict[batch_idx] = result_row
-                            completed_count += 1
-                            if progress_callback:
-                                progress_callback(completed_count, total)
+                        # APIキー未設定や認証エラー等はサイレントに潰さず即時停止
+                        if save_callback:
+                            sorted_results = [results_dict.get(i) for i in sorted(results_dict.keys()) if results_dict.get(i) is not None]
+                            save_callback("save", sorted_results)
+                        raise
         
         # バッチ間で少し待機（レート制限対策）
         if idx < total:
@@ -1083,6 +1061,10 @@ def analyze_all_comments(df, progress_callback=None, save_callback=None, check_c
         print(f"\n警告: レート制限エラーが{rate_limit_error_count}回発生しました。", file=sys.stderr)
     else:
         print("\n✓ レート制限エラーは発生しませんでした（8並列処理で正常に動作しました）。", file=sys.stderr)
+    
+    # デバッグ: トークン使用量の情報を出力
+    print(f"\n[デバッグ] トークン使用量 - 入力: {total_prompt_tokens:,}, 出力: {total_completion_tokens:,}, 合計: {total_tokens:,}", file=sys.stderr)
+    print(f"[デバッグ] 分析完了コメント数: {len(results):,}, 総コメント数: {total}", file=sys.stderr)
     
     result_df = pd.DataFrame(results)
     

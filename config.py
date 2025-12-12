@@ -100,7 +100,7 @@ COMPANIES = {
         "chat_sentiments": CHAT_SENTIMENTS,
         "official_user_type": "moderator",
         "official_guest_id": None,
-        "official_username": None
+        "official_username": ["マツキヨココカラSTAFF"]
     },
     "ヤマダライブ": {
         "name": "ヤマダライブ",
@@ -132,10 +132,30 @@ def get_company_config(company_name: str) -> dict:
 def get_current_company_config():
     """
     現在選択されている企業の設定を取得（セッションステートから）
-    
+
     Returns:
         企業設定の辞書
     """
     import streamlit as st
     selected_company = st.session_state.get("selected_company", DEFAULT_COMPANY)
     return get_company_config(selected_company)
+
+
+def get_openai_api_key():
+    """
+    有効なOpenAI APIキーを取得
+
+    優先順位:
+    1. セッションステート（ユーザー入力）
+    2. ローカルストレージ（記憶されたキー）
+    3. 環境変数
+
+    Returns:
+        有効なAPIキー、なければNone
+    """
+    try:
+        from utils.api_key_manager import get_active_api_key
+        return get_active_api_key()
+    except ImportError:
+        # フォールバック: 環境変数のみ
+        return os.getenv("OPENAI_API_KEY")

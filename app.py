@@ -21,7 +21,18 @@ from utils.google_sheets import (
     calculate_statistics,
     calculate_question_statistics
 )
+from utils.api_key_manager import render_api_key_input, get_active_api_key
 from config import COMPANIES, DEFAULT_COMPANY, get_company_config
+
+
+def inject_custom_css():
+    """カスタムCSSを注入"""
+    css_file_path = os.path.join(os.path.dirname(__file__), "styles", "custom.css")
+
+    if os.path.exists(css_file_path):
+        with open(css_file_path, "r", encoding="utf-8") as f:
+            css = f.read()
+        st.markdown(f"<style>{css}</style>", unsafe_allow_html=True)
 
 
 def remove_live_name_from_filename(filename: str) -> str:
@@ -182,9 +193,18 @@ def main():
     st.set_page_config(
         page_title="ライブ配信チャット分析ツール",
         page_icon="📊",
-        layout="wide"
+        layout="wide",
+        initial_sidebar_state="expanded"
     )
-    
+
+    # カスタムCSSを注入
+    inject_custom_css()
+
+    # サイドバー: APIキー設定
+    with st.sidebar:
+        has_api_key = render_api_key_input()
+        st.divider()
+
     # 機能選択（サイドバー）
     st.sidebar.title("機能選択")
     selected_feature = st.sidebar.radio(
@@ -192,7 +212,7 @@ def main():
         ["コメント分析機能", "質問回答判定機能"],
         index=0
     )
-    
+
     # 企業選択（サイドバー）
     st.sidebar.title("企業選択")
     company_names = list(COMPANIES.keys())
@@ -216,10 +236,16 @@ def main():
     
     # 現在の企業設定を取得
     company_config = get_company_config(selected_company)
-    
-    st.title("📊 ライブ配信チャット分析ツール")
+
+    st.title("ライブ配信チャット分析ツール")
     st.markdown(f"**企業名**: {company_config['name']}")
-    
+
+    # APIキーが設定されていない場合の警告
+    if not has_api_key:
+        st.warning("分析を実行するにはAPIキーの設定が必要です。サイドバーからAPIキーを設定してください。")
+        st.info("[OpenAI APIキーの取得はこちら](https://platform.openai.com/api-keys)")
+        st.stop()
+
     # 選択された機能に応じてページを表示
     if selected_feature == "質問回答判定機能":
         # 質問回答判定機能のページを表示
@@ -268,18 +294,8 @@ def show_comment_analysis_page():
             "estimated_cost_usd": 0.0
         }
     
-    # サイドバー
+    # サイドバー: API使用状況（分析完了時のみ表示）
     with st.sidebar:
-        # 環境変数の確認
-        st.subheader("環境設定")
-        has_openai_key = os.getenv("OPENAI_API_KEY") is not None
-        
-        if has_openai_key:
-            st.success("✓ OpenAI APIキーが設定されています")
-        else:
-            st.error("✗ OpenAI APIキーが設定されていません")
-        
-        # API使用状況（分析完了時のみ表示）
         if st.session_state.get("analysis_complete") and st.session_state.get("api_usage") and st.session_state.api_usage["total_tokens"] > 0:
             st.divider()
             st.subheader("API使用状況")
@@ -406,6 +422,16 @@ def show_comment_analysis_page():
         
         # 分析開始
         if start_analysis or st.session_state.get("analysis_resume", False):
+            # APIキー事前チェック
+            try:
+                from config import get_openai_api_key
+                if not get_openai_api_key():
+                    st.error("OpenAI APIキーが未設定です。サイドバーから設定してください。")
+                    return
+            except Exception:
+                st.error("APIキーの取得に失敗しました。再度キーを入力してください。")
+                return
+
             # 中断フラグをリセット
             st.session_state.analysis_cancelled = False
             # トークン使用量をリセット（新しい分析開始時のみ）
@@ -528,6 +554,13 @@ def show_comment_analysis_page():
                         "total_tokens": total_tokens,
                         "estimated_cost_usd": estimated_cost
                     }
+                    
+                    # デバッグ情報を出力（トークン使用量が0の場合の原因特定用）
+                    if total_tokens == 0:
+                        st.warning(f"⚠️ トークン使用量が0です。分析されたコメント数: {len(analyzed_df)}")
+                else:
+                    # api_usage_infoが空の場合の警告
+                    st.warning("⚠️ API使用量情報が取得できませんでした。")
                 
                 # CSVファイルを自動生成（分析完了時に自動実行）
                 try:
